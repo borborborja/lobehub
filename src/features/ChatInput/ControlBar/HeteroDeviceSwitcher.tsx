@@ -332,6 +332,11 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
 
   const agencyConfig = useAgentStore(agentByIdSelectors.getAgencyConfigById(agentId));
   const updateAgentConfigById = useAgentStore((s) => s.updateAgentConfigById);
+  // Workspace-scoped agent: every workspace member runs through one device pool,
+  // so personal devices (only reachable by their registering user) must be
+  // suppressed from the picker. The server enforces the same rule on writes.
+  const agentWorkspaceId = useAgentStore((s) => s.agentMap[agentId]?.workspaceId);
+  const isWorkspaceAgent = Boolean(agentWorkspaceId);
 
   const heteroType = agencyConfig?.heterogeneousProvider?.type;
   const boundDeviceId = agencyConfig?.boundDeviceId;
@@ -403,7 +408,12 @@ const HeteroDeviceSwitcher = memo<HeteroDeviceSwitcherProps>(({ agentId }) => {
   // header link — avoid showing the same CTA twice.
   const showWebDownloadCard = !isDesktop && hasNoDevices && !isLoading;
 
-  const personalDevices = (devices ?? []).filter((d) => d.scope === 'personal');
+  // Workspace agents drop the personal section entirely — only workspace
+  // devices are reachable to every member, so no one should see (let alone
+  // pick) a teammate's personal machine.
+  const personalDevices = isWorkspaceAgent
+    ? []
+    : (devices ?? []).filter((d) => d.scope === 'personal');
   const workspaceDevices = (devices ?? []).filter((d) => d.scope === 'workspace');
   // Only split into Personal / Workspace sections once a workspace device exists;
   // otherwise (personal mode / OSS) the list stays flat, exactly as before.
