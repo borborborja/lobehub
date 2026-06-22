@@ -65,6 +65,9 @@ jobs:
         id: vars
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Set up QEMU (for cross-arch arm64 build)
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -80,8 +83,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          # Add linux/arm64 here if you deploy on ARM (slower builds; needs QEMU).
-          platforms: linux/amd64
+          # Multi-arch: amd64 servers + arm64 (Apple Silicon / ARM servers).
+          platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             SHA=${{ steps.vars.outputs.sha_short }}
