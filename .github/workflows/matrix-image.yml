@@ -2,18 +2,21 @@ name: Build Matrix-patched image
 
 # Builds a LobeHub image that combines the latest upstream release with the
 # Matrix IM gateway patch (branch `feat/matrix-im-gateway`) and pushes it to
-# GHCR. The patch branch is NOT modified: the upstream release is merged into
-# a throwaway working tree inside the runner, so the PR stays clean.
+# GHCR for both linux/amd64 and linux/arm64.
 #
-# Runs daily and on demand. If upstream and the patch conflict, the merge step
-# fails (you get a red run) — resolve the conflict on the patch branch and
+# Uses NATIVE runners per arch (amd64 on ubuntu-latest, arm64 on
+# ubuntu-24.04-arm) and merges the digests into one manifest — the same shape
+# LobeHub's own release workflow uses. This avoids QEMU emulation, which is so
+# slow for the Next.js build that it blows past the 6h job limit.
+#
+# The patch branch is NOT modified: the upstream release is merged into a
+# throwaway working tree inside each runner, so the PR stays clean. On a
+# merge conflict the build fails — rebase/resolve on the patch branch and
 # re-run.
 
 on:
   workflow_dispatch: {}
   schedule:
-    # Daily at 04:17 UTC. LobeHub releases frequently; a daily rebuild keeps
-    # the image close to upstream without hammering the runner.
     - cron: '17 4 * * *'
 
 permissions:
@@ -27,8 +30,22 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-latest
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.platform }}
     steps:
+      - name: Prepare platform pair
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
       - name: Checkout patch branch (full history)
         uses: actions/checkout@v4
         with:
@@ -44,8 +61,8 @@ jobs:
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
             echo "::error::Could not resolve latest upstream release"; exit 1
           fi
-          echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}"    >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "Latest upstream release: $TAG"
 
       - name: Merge upstream release into the patch (ephemeral)
@@ -65,8 +82,61 @@ jobs:
         id: vars
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU (for cross-arch arm64 build)
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            SHA=${{ steps.vars.outputs.sha_short }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge manifest & push tags
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Resolve latest upstream release
+        id: up
+        run: |
+          set -euo pipefail
+          TAG=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" | jq -r .tag_name)
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -78,30 +148,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          # Multi-arch: amd64 servers + arm64 (Apple Silicon / ARM servers).
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: |
-            SHA=${{ steps.vars.outputs.sha_short }}
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ steps.up.outputs.version }}
-          labels: |
-            org.opencontainers.image.title=lobehub-matrix
-            org.opencontainers.image.description=LobeHub ${{ steps.up.outputs.tag }} + Matrix IM gateway
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-
-      - name: Summary
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
         run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE }}:latest \
+            -t ${{ env.IMAGE }}:${{ steps.up.outputs.version }} \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect & summary
+        run: |
+          docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.up.outputs.version }}
           {
-            echo "### ✅ Built \`${IMAGE}:${{ steps.up.outputs.version }}\`"
+            echo "### ✅ Pushed \`${IMAGE}:${{ steps.up.outputs.version }}\` (amd64 + arm64)"
             echo ""
             echo "- Upstream release: \`${{ steps.up.outputs.tag }}\`"
-            echo "- Tags pushed: \`latest\`, \`${{ steps.up.outputs.version }}\`"
+            echo "- Tags: \`latest\`, \`${{ steps.up.outputs.version }}\`"
             echo "- Pull: \`docker pull ${IMAGE}:latest\`"
           } >> "$GITHUB_STEP_SUMMARY"
